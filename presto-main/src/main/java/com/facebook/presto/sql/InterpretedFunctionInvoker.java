@@ -14,11 +14,10 @@
 package com.facebook.presto.sql;
 
 import com.facebook.presto.metadata.FunctionManager;
-import com.facebook.presto.operator.scalar.ScalarFunctionImplementation;
-import com.facebook.presto.operator.scalar.ScalarFunctionImplementation.ArgumentProperty;
+import com.facebook.presto.operator.scalar.BuiltInScalarFunctionImplementation;
+import com.facebook.presto.operator.scalar.BuiltInScalarFunctionImplementation.ArgumentProperty;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.function.FunctionHandle;
-import com.facebook.presto.spi.function.Signature;
 import com.google.common.base.Defaults;
 
 import java.lang.invoke.MethodHandle;
@@ -26,8 +25,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-import static com.facebook.presto.operator.scalar.ScalarFunctionImplementation.ArgumentType.VALUE_TYPE;
-import static com.facebook.presto.operator.scalar.ScalarFunctionImplementation.NullConvention.USE_NULL_FLAG;
+import static com.facebook.presto.operator.scalar.BuiltInScalarFunctionImplementation.ArgumentType.VALUE_TYPE;
+import static com.facebook.presto.operator.scalar.BuiltInScalarFunctionImplementation.NullConvention.RETURN_NULL_ON_NULL;
+import static com.facebook.presto.operator.scalar.BuiltInScalarFunctionImplementation.NullConvention.USE_NULL_FLAG;
 import static com.google.common.base.Throwables.throwIfUnchecked;
 import static java.lang.invoke.MethodHandleProxies.asInterfaceInstance;
 import static java.util.Objects.requireNonNull;
@@ -48,17 +48,7 @@ public class InterpretedFunctionInvoker
 
     public Object invoke(FunctionHandle functionHandle, ConnectorSession session, List<Object> arguments)
     {
-        return invoke(functionManager.getScalarFunctionImplementation(functionHandle), session, arguments);
-    }
-
-    public Object invoke(Signature function, ConnectorSession session, Object... arguments)
-    {
-        return invoke(function, session, Arrays.asList(arguments));
-    }
-
-    public Object invoke(Signature function, ConnectorSession session, List<Object> arguments)
-    {
-        return invoke(functionManager.getScalarFunctionImplementation(function), session, arguments);
+        return invoke(functionManager.getBuiltInScalarFunctionImplementation(functionHandle), session, arguments);
     }
 
     /**
@@ -66,7 +56,7 @@ public class InterpretedFunctionInvoker
      * <p>
      * Returns a value in the native container type corresponding to the declared SQL return type
      */
-    private Object invoke(ScalarFunctionImplementation function, ConnectorSession session, List<Object> arguments)
+    private Object invoke(BuiltInScalarFunctionImplementation function, ConnectorSession session, List<Object> arguments)
     {
         MethodHandle method = function.getMethodHandle();
 
@@ -81,7 +71,13 @@ public class InterpretedFunctionInvoker
             Object argument = arguments.get(i);
             ArgumentProperty argumentProperty = function.getArgumentProperty(i);
             if (argumentProperty.getArgumentType() == VALUE_TYPE) {
-                if (function.getArgumentProperty(i).getNullConvention() == USE_NULL_FLAG) {
+                if (function.getArgumentProperty(i).getNullConvention() == RETURN_NULL_ON_NULL) {
+                    if (argument == null) {
+                        return null;
+                    }
+                    actualArguments.add(argument);
+                }
+                else if (function.getArgumentProperty(i).getNullConvention() == USE_NULL_FLAG) {
                     boolean isNull = argument == null;
                     if (isNull) {
                         argument = Defaults.defaultValue(method.type().parameterType(actualArguments.size()));
@@ -107,7 +103,7 @@ public class InterpretedFunctionInvoker
         }
     }
 
-    private static MethodHandle bindInstanceFactory(MethodHandle method, ScalarFunctionImplementation implementation)
+    private static MethodHandle bindInstanceFactory(MethodHandle method, BuiltInScalarFunctionImplementation implementation)
     {
         if (!implementation.getInstanceFactory().isPresent()) {
             return method;

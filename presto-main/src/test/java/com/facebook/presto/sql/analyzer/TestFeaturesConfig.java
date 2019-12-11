@@ -13,28 +13,29 @@
  */
 package com.facebook.presto.sql.analyzer;
 
+import com.facebook.airlift.configuration.ConfigurationFactory;
+import com.facebook.airlift.configuration.testing.ConfigAssertions;
 import com.facebook.presto.operator.aggregation.arrayagg.ArrayAggGroupImplementation;
 import com.facebook.presto.operator.aggregation.histogram.HistogramGroupImplementation;
 import com.facebook.presto.operator.aggregation.multimapagg.MultimapAggGroupImplementation;
 import com.google.common.collect.ImmutableMap;
-import io.airlift.configuration.ConfigurationFactory;
-import io.airlift.configuration.testing.ConfigAssertions;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import org.testng.annotations.Test;
 
 import java.util.Map;
 
+import static com.facebook.airlift.configuration.testing.ConfigAssertions.assertFullMapping;
+import static com.facebook.airlift.configuration.testing.ConfigAssertions.assertRecordedDefaults;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType.BROADCAST;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType.PARTITIONED;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinReorderingStrategy.ELIMINATE_CROSS_JOINS;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinReorderingStrategy.NONE;
+import static com.facebook.presto.sql.analyzer.FeaturesConfig.PartialMergePushdownStrategy.PUSH_THROUGH_LOW_MEMORY_OPERATORS;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.SPILLER_SPILL_PATH;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.SPILL_ENABLED;
 import static com.facebook.presto.sql.analyzer.RegexLibrary.JONI;
 import static com.facebook.presto.sql.analyzer.RegexLibrary.RE2J;
-import static io.airlift.configuration.testing.ConfigAssertions.assertFullMapping;
-import static io.airlift.configuration.testing.ConfigAssertions.assertRecordedDefaults;
 import static io.airlift.units.DataSize.Unit.GIGABYTE;
 import static io.airlift.units.DataSize.Unit.KILOBYTE;
 import static io.airlift.units.DataSize.Unit.MEGABYTE;
@@ -54,12 +55,16 @@ public class TestFeaturesConfig
                 .setJoinDistributionType(PARTITIONED)
                 .setJoinMaxBroadcastTableSize(null)
                 .setGroupedExecutionForAggregationEnabled(false)
+                .setGroupedExecutionForEligibleTableScansEnabled(false)
                 .setDynamicScheduleForGroupedExecutionEnabled(false)
+                .setRecoverableGroupedExecutionEnabled(false)
+                .setMaxFailedTaskPercentage(0.3)
                 .setConcurrentLifespansPerTask(0)
                 .setFastInequalityJoins(true)
                 .setColocatedJoinsEnabled(false)
                 .setSpatialJoinsEnabled(true)
                 .setJoinReorderingStrategy(ELIMINATE_CROSS_JOINS)
+                .setPartialMergePushdownStrategy(FeaturesConfig.PartialMergePushdownStrategy.NONE)
                 .setMaxReorderedJoins(9)
                 .setRedistributeWrites(true)
                 .setScaleWriters(false)
@@ -109,7 +114,15 @@ public class TestFeaturesConfig
                 .setDistributedSortEnabled(true)
                 .setMaxGroupingSets(2048)
                 .setLegacyUnnestArrayRows(false)
-                .setJsonSerdeCodeGenerationEnabled(false));
+                .setJsonSerdeCodeGenerationEnabled(false)
+                .setPushLimitThroughOuterJoin(true)
+                .setMaxConcurrentMaterializations(3)
+                .setPushdownSubfieldsEnabled(false)
+                .setTableWriterMergeOperatorEnabled(true)
+                .setOptimizeFullOuterJoinWithCoalesce(true)
+                .setIndexLoaderTimeout(new Duration(20, SECONDS))
+                .setOptimizedRepartitioningEnabled(false)
+                .setListNonBuiltInFunctions(false));
     }
 
     @Test
@@ -135,12 +148,16 @@ public class TestFeaturesConfig
                 .put("join-distribution-type", "BROADCAST")
                 .put("join-max-broadcast-table-size", "42GB")
                 .put("grouped-execution-for-aggregation-enabled", "true")
+                .put("experimental.grouped-execution-for-eligible-table-scans-enabled", "true")
                 .put("dynamic-schedule-for-grouped-execution", "true")
+                .put("recoverable-grouped-execution-enabled", "true")
+                .put("max-failed-task-percentage", "0.8")
                 .put("concurrent-lifespans-per-task", "1")
                 .put("fast-inequality-joins", "false")
                 .put("colocated-joins-enabled", "true")
                 .put("spatial-joins-enabled", "false")
                 .put("optimizer.join-reordering-strategy", "NONE")
+                .put("experimental.optimizer.partial-merge-pushdown-strategy", PUSH_THROUGH_LOW_MEMORY_OPERATORS.name())
                 .put("optimizer.max-reordered-joins", "5")
                 .put("redistribute-writes", "false")
                 .put("scale-writers", "true")
@@ -179,6 +196,14 @@ public class TestFeaturesConfig
                 .put("analyzer.max-grouping-sets", "2047")
                 .put("deprecated.legacy-unnest-array-rows", "true")
                 .put("experimental.json-serde-codegen-enabled", "true")
+                .put("optimizer.push-limit-through-outer-join", "false")
+                .put("max-concurrent-materializations", "5")
+                .put("experimental.pushdown-subfields-enabled", "true")
+                .put("experimental.table-writer-merge-operator-enabled", "false")
+                .put("optimizer.optimize-full-outer-join-with-coalesce", "false")
+                .put("index-loader-timeout", "10s")
+                .put("experimental.optimized-repartitioning", "true")
+                .put("list-non-built-in-functions", "true")
                 .build();
 
         FeaturesConfig expected = new FeaturesConfig()
@@ -194,12 +219,16 @@ public class TestFeaturesConfig
                 .setJoinDistributionType(BROADCAST)
                 .setJoinMaxBroadcastTableSize(new DataSize(42, GIGABYTE))
                 .setGroupedExecutionForAggregationEnabled(true)
+                .setGroupedExecutionForEligibleTableScansEnabled(true)
                 .setDynamicScheduleForGroupedExecutionEnabled(true)
+                .setRecoverableGroupedExecutionEnabled(true)
+                .setMaxFailedTaskPercentage(0.8)
                 .setConcurrentLifespansPerTask(1)
                 .setFastInequalityJoins(false)
                 .setColocatedJoinsEnabled(true)
                 .setSpatialJoinsEnabled(false)
                 .setJoinReorderingStrategy(NONE)
+                .setPartialMergePushdownStrategy(PUSH_THROUGH_LOW_MEMORY_OPERATORS)
                 .setMaxReorderedJoins(5)
                 .setRedistributeWrites(false)
                 .setScaleWriters(true)
@@ -244,7 +273,15 @@ public class TestFeaturesConfig
                 .setMaxGroupingSets(2047)
                 .setLegacyUnnestArrayRows(true)
                 .setDefaultFilterFactorEnabled(true)
-                .setJsonSerdeCodeGenerationEnabled(true);
+                .setJsonSerdeCodeGenerationEnabled(true)
+                .setPushLimitThroughOuterJoin(false)
+                .setMaxConcurrentMaterializations(5)
+                .setPushdownSubfieldsEnabled(true)
+                .setTableWriterMergeOperatorEnabled(false)
+                .setOptimizeFullOuterJoinWithCoalesce(false)
+                .setIndexLoaderTimeout(new Duration(10, SECONDS))
+                .setOptimizedRepartitioningEnabled(true)
+                .setListNonBuiltInFunctions(true);
         assertFullMapping(properties, expected);
     }
 

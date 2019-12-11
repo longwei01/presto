@@ -13,67 +13,77 @@
  */
 package com.facebook.presto.sql.gen;
 
+import com.facebook.presto.bytecode.BytecodeBlock;
+import com.facebook.presto.bytecode.BytecodeNode;
+import com.facebook.presto.bytecode.ClassDefinition;
+import com.facebook.presto.bytecode.Scope;
+import com.facebook.presto.bytecode.Variable;
 import com.facebook.presto.metadata.FunctionManager;
+import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.function.FunctionMetadata;
+import com.facebook.presto.spi.function.SqlFunctionProperties;
+import com.facebook.presto.spi.function.SqlInvokedScalarFunctionImplementation;
+import com.facebook.presto.spi.relation.CallExpression;
+import com.facebook.presto.spi.relation.ConstantExpression;
+import com.facebook.presto.spi.relation.InputReferenceExpression;
+import com.facebook.presto.spi.relation.LambdaDefinitionExpression;
+import com.facebook.presto.spi.relation.RowExpression;
+import com.facebook.presto.spi.relation.RowExpressionVisitor;
+import com.facebook.presto.spi.relation.SpecialFormExpression;
+import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.gen.LambdaBytecodeGenerator.CompiledLambda;
-import com.facebook.presto.sql.relational.CallExpression;
-import com.facebook.presto.sql.relational.ConstantExpression;
-import com.facebook.presto.sql.relational.InputReferenceExpression;
-import com.facebook.presto.sql.relational.LambdaDefinitionExpression;
-import com.facebook.presto.sql.relational.RowExpression;
-import com.facebook.presto.sql.relational.RowExpressionVisitor;
-import com.facebook.presto.sql.relational.VariableReferenceExpression;
 import com.google.common.base.VerifyException;
 import com.google.common.collect.ImmutableList;
-import io.airlift.bytecode.BytecodeBlock;
-import io.airlift.bytecode.BytecodeNode;
-import io.airlift.bytecode.Scope;
-import io.airlift.bytecode.Variable;
+import com.google.common.collect.ImmutableMap;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
+import static com.facebook.presto.bytecode.expression.BytecodeExpressions.constantTrue;
+import static com.facebook.presto.bytecode.instruction.Constant.loadBoolean;
+import static com.facebook.presto.bytecode.instruction.Constant.loadDouble;
+import static com.facebook.presto.bytecode.instruction.Constant.loadFloat;
+import static com.facebook.presto.bytecode.instruction.Constant.loadInt;
+import static com.facebook.presto.bytecode.instruction.Constant.loadLong;
+import static com.facebook.presto.bytecode.instruction.Constant.loadString;
+import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.IS_NULL;
+import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.OR;
+import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.sql.gen.BytecodeUtils.generateWrite;
 import static com.facebook.presto.sql.gen.BytecodeUtils.loadConstant;
 import static com.facebook.presto.sql.gen.LambdaBytecodeGenerator.generateLambda;
-import static com.facebook.presto.sql.relational.Signatures.BIND;
-import static com.facebook.presto.sql.relational.Signatures.CAST;
-import static com.facebook.presto.sql.relational.Signatures.COALESCE;
-import static com.facebook.presto.sql.relational.Signatures.DEREFERENCE;
-import static com.facebook.presto.sql.relational.Signatures.IF;
-import static com.facebook.presto.sql.relational.Signatures.IN;
-import static com.facebook.presto.sql.relational.Signatures.IS_NULL;
-import static com.facebook.presto.sql.relational.Signatures.NULL_IF;
-import static com.facebook.presto.sql.relational.Signatures.ROW_CONSTRUCTOR;
-import static com.facebook.presto.sql.relational.Signatures.SWITCH;
+import static com.facebook.presto.sql.gen.LambdaBytecodeGenerator.generateMethodsForLambda;
+import static com.facebook.presto.sql.relational.SqlFunctionUtils.getSqlFunctionRowExpression;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
-import static io.airlift.bytecode.expression.BytecodeExpressions.constantTrue;
-import static io.airlift.bytecode.instruction.Constant.loadBoolean;
-import static io.airlift.bytecode.instruction.Constant.loadDouble;
-import static io.airlift.bytecode.instruction.Constant.loadFloat;
-import static io.airlift.bytecode.instruction.Constant.loadInt;
-import static io.airlift.bytecode.instruction.Constant.loadLong;
-import static io.airlift.bytecode.instruction.Constant.loadString;
+import static java.lang.String.format;
 
 public class RowExpressionCompiler
 {
+    private final ClassDefinition classDefinition;
     private final CallSiteBinder callSiteBinder;
     private final CachedInstanceBinder cachedInstanceBinder;
     private final RowExpressionVisitor<BytecodeNode, Scope> fieldReferenceCompiler;
-    private final FunctionManager functionManager;
+    private final Metadata metadata;
+    private final SqlFunctionProperties sqlFunctionProperties;
     private final Map<LambdaDefinitionExpression, CompiledLambda> compiledLambdaMap;
 
     RowExpressionCompiler(
+            ClassDefinition classDefinition,
             CallSiteBinder callSiteBinder,
             CachedInstanceBinder cachedInstanceBinder,
             RowExpressionVisitor<BytecodeNode, Scope> fieldReferenceCompiler,
-            FunctionManager functionManager,
+            Metadata metadata,
+            SqlFunctionProperties sqlFunctionProperties,
             Map<LambdaDefinitionExpression, CompiledLambda> compiledLambdaMap)
     {
+        this.classDefinition = classDefinition;
         this.callSiteBinder = callSiteBinder;
         this.cachedInstanceBinder = cachedInstanceBinder;
         this.fieldReferenceCompiler = fieldReferenceCompiler;
-        this.functionManager = functionManager;
+        this.metadata = metadata;
+        this.sqlFunctionProperties = sqlFunctionProperties;
         this.compiledLambdaMap = compiledLambdaMap;
     }
 
@@ -95,64 +105,62 @@ public class RowExpressionCompiler
         @Override
         public BytecodeNode visitCall(CallExpression call, Context context)
         {
-            BytecodeGenerator generator;
-            // special-cased in function manager
-            if (call.getSignature().getName().equals(CAST)) {
-                generator = new CastCodeGenerator();
-            }
-            else {
-                switch (call.getSignature().getName()) {
-                    // lazy evaluation
-                    case IF:
-                        generator = new IfCodeGenerator();
-                        break;
-                    case NULL_IF:
-                        generator = new NullIfCodeGenerator();
-                        break;
-                    case SWITCH:
-                        // (SWITCH <expr> (WHEN <expr> <expr>) (WHEN <expr> <expr>) <expr>)
-                        generator = new SwitchCodeGenerator();
-                        break;
-                    // functions that take null as input
-                    case IS_NULL:
-                        generator = new IsNullCodeGenerator();
-                        break;
-                    case COALESCE:
-                        generator = new CoalesceCodeGenerator();
-                        break;
-                    // functions that require varargs and/or complex types (e.g., lists)
-                    case IN:
-                        generator = new InCodeGenerator(functionManager);
-                        break;
-                    // optimized implementations (shortcircuiting behavior)
-                    case "AND":
-                        generator = new AndCodeGenerator();
-                        break;
-                    case "OR":
-                        generator = new OrCodeGenerator();
-                        break;
-                    case DEREFERENCE:
-                        generator = new DereferenceCodeGenerator();
-                        break;
-                    case ROW_CONSTRUCTOR:
-                        generator = new RowConstructorCodeGenerator();
-                        break;
-                    case BIND:
-                        generator = new BindCodeGenerator(compiledLambdaMap, context.getLambdaInterface().get());
-                        break;
-                    default:
-                        generator = new FunctionCallCodeGenerator();
-                }
-            }
+            FunctionManager functionManager = metadata.getFunctionManager();
+            FunctionMetadata functionMetadata = functionManager.getFunctionMetadata(call.getFunctionHandle());
+            BytecodeGeneratorContext generatorContext;
+            switch (functionMetadata.getImplementationType()) {
+                case BUILTIN:
+                    generatorContext = new BytecodeGeneratorContext(
+                            RowExpressionCompiler.this,
+                            context.getScope(),
+                            callSiteBinder,
+                            cachedInstanceBinder,
+                            functionManager);
+                    return (new FunctionCallCodeGenerator()).generateCall(call.getFunctionHandle(), generatorContext, call.getType(), call.getArguments(), context.getOutputBlockVariable());
+                case SQL:
+                    SqlInvokedScalarFunctionImplementation functionImplementation = (SqlInvokedScalarFunctionImplementation) functionManager.getScalarFunctionImplementation(call.getFunctionHandle());
+                    RowExpression function = getSqlFunctionRowExpression(functionMetadata, functionImplementation, metadata, sqlFunctionProperties, call.getArguments());
 
-            BytecodeGeneratorContext generatorContext = new BytecodeGeneratorContext(
-                    RowExpressionCompiler.this,
-                    context.getScope(),
-                    callSiteBinder,
-                    cachedInstanceBinder,
-                    functionManager);
+                    // Pre-compile lambda bytecode
+                    // When we inline the input parameters, if the parameter contains lambda, that lambda has already been pre-compiled and exist in compiledLambdaMap. When we pre-compile the function
+                    // it would be compiled again. Do not put these in the new map in this case.
+                    Map<LambdaDefinitionExpression, LambdaBytecodeGenerator.CompiledLambda> newCompiledLambdaMap = new HashMap<>(compiledLambdaMap);
+                    generateMethodsForLambda(classDefinition, callSiteBinder, cachedInstanceBinder, function, metadata, sqlFunctionProperties, "sql")
+                        .forEach(newCompiledLambdaMap::putIfAbsent);
 
-            return generator.generateExpression(call.getSignature(), generatorContext, call.getType(), call.getArguments(), context.getOutputBlockVariable());
+                    // generate bytecode for SQL function
+                    RowExpressionCompiler newRowExpressionCompiler = new RowExpressionCompiler(classDefinition, callSiteBinder, cachedInstanceBinder, fieldReferenceCompiler, metadata, sqlFunctionProperties, ImmutableMap.copyOf(newCompiledLambdaMap));
+                    // If called on null input, directly use the generated bytecode
+                    if (functionMetadata.isCalledOnNullInput() || call.getArguments().isEmpty()) {
+                        return newRowExpressionCompiler.compile(
+                                function,
+                                context.getScope(),
+                                context.getOutputBlockVariable(),
+                                context.getLambdaInterface());
+                    }
+
+                    // If returns null on null input, generate if(any input is null, null, generated bytecode)
+                    generatorContext = new BytecodeGeneratorContext(
+                            newRowExpressionCompiler,
+                            context.getScope(),
+                            callSiteBinder,
+                            cachedInstanceBinder,
+                            functionManager);
+
+                    return (new IfCodeGenerator()).generateExpression(
+                            generatorContext,
+                            call.getType(),
+                            ImmutableList.of(
+                                    call.getArguments().stream()
+                                            .map(argument -> new SpecialFormExpression(IS_NULL, BOOLEAN, argument))
+                                            .reduce((a, b) -> new SpecialFormExpression(OR, BOOLEAN, a, b)).get(),
+                                    new ConstantExpression(null, call.getType()),
+                                    function),
+                            context.getOutputBlockVariable());
+
+                default:
+                    throw new IllegalArgumentException(format("Unsupported function implementation type: %s", functionMetadata.getImplementationType()));
+            }
         }
 
         @Override
@@ -244,7 +252,7 @@ public class RowExpressionCompiler
                     context.getScope(),
                     callSiteBinder,
                     cachedInstanceBinder,
-                    functionManager);
+                    metadata.getFunctionManager());
 
             return generateLambda(
                     generatorContext,
@@ -269,6 +277,62 @@ public class RowExpressionCompiler
                             context.getScope().getVariable("wasNull"),
                             reference.getType(),
                             context.getOutputBlockVariable().get()));
+        }
+
+        @Override
+        public BytecodeNode visitSpecialForm(SpecialFormExpression specialForm, Context context)
+        {
+            SpecialFormBytecodeGenerator generator;
+            switch (specialForm.getForm()) {
+                // lazy evaluation
+                case IF:
+                    generator = new IfCodeGenerator();
+                    break;
+                case NULL_IF:
+                    generator = new NullIfCodeGenerator();
+                    break;
+                case SWITCH:
+                    // (SWITCH <expr> (WHEN <expr> <expr>) (WHEN <expr> <expr>) <expr>)
+                    generator = new SwitchCodeGenerator();
+                    break;
+                // functions that take null as input
+                case IS_NULL:
+                    generator = new IsNullCodeGenerator();
+                    break;
+                case COALESCE:
+                    generator = new CoalesceCodeGenerator();
+                    break;
+                // functions that require varargs and/or complex types (e.g., lists)
+                case IN:
+                    generator = new InCodeGenerator(metadata.getFunctionManager());
+                    break;
+                // optimized implementations (shortcircuiting behavior)
+                case AND:
+                    generator = new AndCodeGenerator();
+                    break;
+                case OR:
+                    generator = new OrCodeGenerator();
+                    break;
+                case DEREFERENCE:
+                    generator = new DereferenceCodeGenerator();
+                    break;
+                case ROW_CONSTRUCTOR:
+                    generator = new RowConstructorCodeGenerator();
+                    break;
+                case BIND:
+                    generator = new BindCodeGenerator(compiledLambdaMap, context.getLambdaInterface().get());
+                    break;
+                default:
+                    throw new IllegalStateException("Cannot compile special form: " + specialForm.getForm());
+            }
+            BytecodeGeneratorContext generatorContext = new BytecodeGeneratorContext(
+                    RowExpressionCompiler.this,
+                    context.getScope(),
+                    callSiteBinder,
+                    cachedInstanceBinder,
+                    metadata.getFunctionManager());
+
+            return generator.generateExpression(generatorContext, specialForm.getType(), specialForm.getArguments(), context.getOutputBlockVariable());
         }
     }
 

@@ -13,11 +13,11 @@
  */
 package com.facebook.presto.execution;
 
+import com.facebook.airlift.configuration.Config;
+import com.facebook.airlift.configuration.ConfigDescription;
+import com.facebook.airlift.configuration.DefunctConfig;
+import com.facebook.airlift.configuration.LegacyConfig;
 import com.facebook.presto.util.PowerOfTwo;
-import io.airlift.configuration.Config;
-import io.airlift.configuration.ConfigDescription;
-import io.airlift.configuration.DefunctConfig;
-import io.airlift.configuration.LegacyConfig;
 import io.airlift.units.DataSize;
 import io.airlift.units.DataSize.Unit;
 import io.airlift.units.Duration;
@@ -63,9 +63,12 @@ public class TaskManagerConfig
     private Duration infoMaxAge = new Duration(15, TimeUnit.MINUTES);
 
     private Duration statusRefreshMaxWait = new Duration(1, TimeUnit.SECONDS);
+    private Duration infoRefreshMaxWait = new Duration(0, TimeUnit.SECONDS);
+
     private Duration infoUpdateInterval = new Duration(3, TimeUnit.SECONDS);
 
     private int writerCount = 1;
+    private Integer partitionedWriterCount;
     private int taskConcurrency = 16;
     private int httpResponseThreads = 100;
     private int httpTimeoutThreads = 3;
@@ -105,6 +108,21 @@ public class TaskManagerConfig
     public TaskManagerConfig setInfoUpdateInterval(Duration infoUpdateInterval)
     {
         this.infoUpdateInterval = infoUpdateInterval;
+        return this;
+    }
+
+    @NotNull
+    public Duration getInfoRefreshMaxWait()
+    {
+        return infoRefreshMaxWait;
+    }
+
+    @Config("experimental.task.info-update-refresh-max-wait")
+    @ConfigDescription("When this is set to non-zero, task info update request will be a long polling with " +
+            "given maximum update refresh wait time. This is an experimental config to reduce unnecessary task info update.")
+    public TaskManagerConfig setInfoRefreshMaxWait(Duration infoRefreshMaxWait)
+    {
+        this.infoRefreshMaxWait = infoRefreshMaxWait;
         return this;
     }
 
@@ -377,6 +395,21 @@ public class TaskManagerConfig
     public TaskManagerConfig setWriterCount(int writerCount)
     {
         this.writerCount = writerCount;
+        return this;
+    }
+
+    @Min(1)
+    @PowerOfTwo
+    public Integer getPartitionedWriterCount()
+    {
+        return partitionedWriterCount;
+    }
+
+    @Config("task.partitioned-writer-count")
+    @ConfigDescription("Number of writers per task for partitioned writes. If not set, the number set by task.writer-count will be used")
+    public TaskManagerConfig setPartitionedWriterCount(Integer partitionedWriterCount)
+    {
+        this.partitionedWriterCount = partitionedWriterCount;
         return this;
     }
 

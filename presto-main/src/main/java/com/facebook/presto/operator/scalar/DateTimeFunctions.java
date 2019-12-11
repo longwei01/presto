@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.operator.scalar;
 
+import com.facebook.airlift.concurrent.ThreadLocalCache;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.function.Description;
@@ -21,7 +22,6 @@ import com.facebook.presto.spi.function.ScalarFunction;
 import com.facebook.presto.spi.function.SqlType;
 import com.facebook.presto.spi.type.StandardTypes;
 import com.facebook.presto.spi.type.TimeZoneKey;
-import io.airlift.concurrent.ThreadLocalCache;
 import io.airlift.slice.Slice;
 import io.airlift.units.Duration;
 import org.joda.time.DateTime;
@@ -1176,7 +1176,7 @@ public final class DateTimeFunctions
 
         String formatString = format.toStringUtf8();
         boolean escaped = false;
-        for (int i = 0; i < format.length(); i++) {
+        for (int i = 0; i < formatString.length(); i++) {
             char character = formatString.charAt(i);
 
             if (escaped) {

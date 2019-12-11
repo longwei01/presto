@@ -13,25 +13,26 @@
  */
 package com.facebook.presto.execution;
 
+import com.facebook.airlift.node.NodeInfo;
+import com.facebook.airlift.stats.TestingGcMonitor;
 import com.facebook.presto.execution.buffer.BufferResult;
 import com.facebook.presto.execution.buffer.BufferState;
 import com.facebook.presto.execution.buffer.OutputBuffers;
 import com.facebook.presto.execution.buffer.OutputBuffers.OutputBufferId;
 import com.facebook.presto.execution.executor.TaskExecutor;
+import com.facebook.presto.execution.scheduler.TableWriteInfo;
 import com.facebook.presto.memory.LocalMemoryManager;
 import com.facebook.presto.memory.NodeMemoryConfig;
 import com.facebook.presto.memory.context.LocalMemoryContext;
+import com.facebook.presto.metadata.InternalNode;
 import com.facebook.presto.operator.ExchangeClient;
 import com.facebook.presto.operator.ExchangeClientSupplier;
-import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.spiller.LocalSpillManager;
 import com.facebook.presto.spiller.NodeSpillConfig;
 import com.google.common.base.Ticker;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
-import io.airlift.node.NodeInfo;
-import io.airlift.stats.TestingGcMonitor;
 import io.airlift.units.DataSize;
 import io.airlift.units.DataSize.Unit;
 import io.airlift.units.Duration;
@@ -61,7 +62,7 @@ import static org.testng.Assert.assertNull;
 @Test
 public class TestSqlTaskManager
 {
-    private static final TaskId TASK_ID = new TaskId("query", 0, 1);
+    private static final TaskId TASK_ID = new TaskId("query", 0, 0, 1);
     public static final OutputBufferId OUT = new OutputBufferId(0);
 
     private final TaskExecutor taskExecutor;
@@ -244,6 +245,7 @@ public class TestSqlTaskManager
                 config,
                 new NodeMemoryConfig(),
                 localSpillManager,
+                new MockExchangeClientSupplier(),
                 new NodeSpillConfig(),
                 new TestingGcMonitor());
     }
@@ -255,7 +257,8 @@ public class TestSqlTaskManager
                 Optional.of(PLAN_FRAGMENT),
                 ImmutableList.of(new TaskSource(TABLE_SCAN_NODE_ID, splits, true)),
                 outputBuffers,
-                OptionalInt.empty());
+                OptionalInt.empty(),
+                Optional.of(new TableWriteInfo(Optional.empty(), Optional.empty(), Optional.empty())));
     }
 
     private TaskInfo createTask(SqlTaskManager sqlTaskManager, TaskId taskId, OutputBuffers outputBuffers)
@@ -274,7 +277,8 @@ public class TestSqlTaskManager
                 Optional.of(PLAN_FRAGMENT),
                 ImmutableList.of(),
                 outputBuffers,
-                OptionalInt.empty());
+                OptionalInt.empty(),
+                Optional.of(new TableWriteInfo(Optional.empty(), Optional.empty(), Optional.empty())));
     }
 
     public static class MockExchangeClientSupplier
@@ -309,13 +313,13 @@ public class TestSqlTaskManager
         }
 
         @Override
-        public URI createTaskLocation(Node node, TaskId taskId)
+        public URI createTaskLocation(InternalNode node, TaskId taskId)
         {
             return URI.create("http://fake.invalid/task/" + node.getNodeIdentifier() + "/" + taskId);
         }
 
         @Override
-        public URI createMemoryInfoLocation(Node node)
+        public URI createMemoryInfoLocation(InternalNode node)
         {
             return URI.create("http://fake.invalid/" + node.getNodeIdentifier() + "/memory");
         }

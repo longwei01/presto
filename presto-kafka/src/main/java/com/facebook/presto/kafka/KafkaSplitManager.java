@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.kafka;
 
+import com.facebook.airlift.log.Logger;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorSplit;
 import com.facebook.presto.spi.ConnectorSplitSource;
@@ -26,9 +27,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.io.CharStreams;
-import io.airlift.log.Logger;
 import kafka.api.PartitionOffsetRequestInfo;
-import kafka.cluster.Broker;
+import kafka.cluster.BrokerEndPoint;
 import kafka.common.TopicAndPartition;
 import kafka.javaapi.OffsetRequest;
 import kafka.javaapi.OffsetResponse;
@@ -85,7 +85,11 @@ public class KafkaSplitManager
     }
 
     @Override
-    public ConnectorSplitSource getSplits(ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableLayoutHandle layout, SplitSchedulingStrategy splitSchedulingStrategy)
+    public ConnectorSplitSource getSplits(
+            ConnectorTransactionHandle transaction,
+            ConnectorSession session,
+            ConnectorTableLayoutHandle layout,
+            SplitSchedulingContext splitSchedulingContext)
     {
         KafkaTableHandle kafkaTableHandle = convertLayout(layout).getTable();
         try {
@@ -100,7 +104,7 @@ public class KafkaSplitManager
                 for (PartitionMetadata part : metadata.partitionsMetadata()) {
                     log.debug("Adding Partition %s/%s", metadata.topic(), part.partitionId());
 
-                    Broker leader = part.leader();
+                    BrokerEndPoint leader = part.leader();
                     if (leader == null) {
                         throw new PrestoException(GENERIC_INTERNAL_ERROR, format("Leader election in progress for Kafka topic '%s' partition %s", metadata.topic(), part.partitionId()));
                     }

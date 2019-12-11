@@ -13,6 +13,8 @@
  */
 package com.facebook.presto.benchmark;
 
+import com.facebook.airlift.stats.CpuTimer;
+import com.facebook.airlift.stats.TestingGcMonitor;
 import com.facebook.presto.Session;
 import com.facebook.presto.execution.Lifespan;
 import com.facebook.presto.execution.TaskId;
@@ -22,9 +24,6 @@ import com.facebook.presto.memory.QueryContext;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.QualifiedObjectName;
 import com.facebook.presto.metadata.Split;
-import com.facebook.presto.metadata.TableHandle;
-import com.facebook.presto.metadata.TableLayoutHandle;
-import com.facebook.presto.metadata.TableLayoutResult;
 import com.facebook.presto.operator.Driver;
 import com.facebook.presto.operator.DriverContext;
 import com.facebook.presto.operator.FilterAndProjectOperator;
@@ -35,30 +34,27 @@ import com.facebook.presto.operator.PageSourceOperator;
 import com.facebook.presto.operator.TaskContext;
 import com.facebook.presto.operator.TaskStats;
 import com.facebook.presto.operator.project.InputPageProjection;
-import com.facebook.presto.operator.project.InterpretedPageProjection;
 import com.facebook.presto.operator.project.PageProcessor;
 import com.facebook.presto.operator.project.PageProjection;
 import com.facebook.presto.security.AllowAllAccessControl;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorPageSource;
-import com.facebook.presto.spi.Constraint;
 import com.facebook.presto.spi.QueryId;
+import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.memory.MemoryPoolId;
+import com.facebook.presto.spi.plan.PlanNodeId;
+import com.facebook.presto.spi.relation.RowExpression;
+import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spiller.SpillSpaceTracker;
 import com.facebook.presto.split.SplitSource;
-import com.facebook.presto.sql.planner.Symbol;
-import com.facebook.presto.sql.planner.TypeProvider;
+import com.facebook.presto.sql.gen.PageFunctionCompiler;
 import com.facebook.presto.sql.planner.optimizations.HashGenerationOptimizer;
-import com.facebook.presto.sql.planner.plan.PlanNodeId;
-import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.testing.LocalQueryRunner;
 import com.facebook.presto.transaction.TransactionId;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
-import io.airlift.stats.CpuTimer;
-import io.airlift.stats.TestingGcMonitor;
 import io.airlift.units.DataSize;
 
 import java.util.ArrayList;
@@ -68,18 +64,19 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 
+import static com.facebook.airlift.concurrent.MoreFutures.getFutureValue;
+import static com.facebook.airlift.stats.CpuTimer.CpuDuration;
 import static com.facebook.presto.SystemSessionProperties.getFilterAndProjectMinOutputPageRowCount;
 import static com.facebook.presto.SystemSessionProperties.getFilterAndProjectMinOutputPageSize;
 import static com.facebook.presto.spi.connector.ConnectorSplitManager.SplitSchedulingStrategy.UNGROUPED_SCHEDULING;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
+import static com.facebook.presto.sql.relational.VariableToChannelTranslator.translate;
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
-import static io.airlift.concurrent.MoreFutures.getFutureValue;
-import static io.airlift.stats.CpuTimer.CpuDuration;
 import static io.airlift.units.DataSize.Unit.BYTE;
 import static io.airlift.units.DataSize.Unit.GIGABYTE;
 import static io.airlift.units.DataSize.Unit.MEGABYTE;
@@ -169,9 +166,7 @@ public abstract class AbstractOperatorBenchmark
         }
         List<ColumnHandle> columnHandles = columnHandlesBuilder.build();
 
-        // get the split for this table
-        List<TableLayoutResult> layouts = metadata.getLayouts(session, tableHandle, Constraint.alwaysTrue(), Optional.empty());
-        Split split = getLocalQuerySplit(session, layouts.get(0).getLayout().getHandle());
+        Split split = getLocalQuerySplit(session, tableHandle);
 
         return new OperatorFactory()
         {
@@ -179,7 +174,7 @@ public abstract class AbstractOperatorBenchmark
             public Operator createOperator(DriverContext driverContext)
             {
                 OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, planNodeId, "BenchmarkSource");
-                ConnectorPageSource pageSource = localQueryRunner.getPageSourceManager().createPageSource(session, split, columnHandles);
+                ConnectorPageSource pageSource = localQueryRunner.getPageSourceManager().createPageSource(session, split, tableHandle, columnHandles);
                 return new PageSourceOperator(pageSource, operatorContext);
             }
 
@@ -196,7 +191,7 @@ public abstract class AbstractOperatorBenchmark
         };
     }
 
-    private Split getLocalQuerySplit(Session session, TableLayoutHandle handle)
+    private Split getLocalQuerySplit(Session session, TableHandle handle)
     {
         SplitSource splitSource = localQueryRunner.getSplitManager().getSplits(session, handle, UNGROUPED_SCHEDULING);
         List<Split> splits = new ArrayList<>();
@@ -214,25 +209,22 @@ public abstract class AbstractOperatorBenchmark
 
     protected final OperatorFactory createHashProjectOperator(int operatorId, PlanNodeId planNodeId, List<Type> types)
     {
-        ImmutableMap.Builder<Symbol, Type> symbolTypes = ImmutableMap.builder();
-        ImmutableMap.Builder<Symbol, Integer> symbolToInputMapping = ImmutableMap.builder();
+        ImmutableList.Builder<VariableReferenceExpression> variables = ImmutableList.builder();
+        ImmutableMap.Builder<VariableReferenceExpression, Integer> variableToInputMapping = ImmutableMap.builder();
         ImmutableList.Builder<PageProjection> projections = ImmutableList.builder();
         for (int channel = 0; channel < types.size(); channel++) {
-            Symbol symbol = new Symbol("h" + channel);
-            symbolTypes.put(symbol, types.get(channel));
-            symbolToInputMapping.put(symbol, channel);
+            VariableReferenceExpression variable = new VariableReferenceExpression("h" + channel, types.get(channel));
+            variables.add(variable);
+            variableToInputMapping.put(variable, channel);
             projections.add(new InputPageProjection(channel, types.get(channel)));
         }
 
-        Optional<Expression> hashExpression = HashGenerationOptimizer.getHashExpression(ImmutableList.copyOf(symbolTypes.build().keySet()));
+        Optional<RowExpression> hashExpression = HashGenerationOptimizer.getHashExpression(localQueryRunner.getMetadata().getFunctionManager(), variables.build());
         verify(hashExpression.isPresent());
-        projections.add(new InterpretedPageProjection(
-                hashExpression.get(),
-                TypeProvider.copyOf(symbolTypes.build()),
-                symbolToInputMapping.build(),
-                localQueryRunner.getMetadata(),
-                localQueryRunner.getSqlParser(),
-                session));
+        RowExpression translatedHashExpression = translate(hashExpression.get(), variableToInputMapping.build());
+
+        PageFunctionCompiler functionCompiler = new PageFunctionCompiler(localQueryRunner.getMetadata(), 0);
+        projections.add(functionCompiler.compileProjection(session.getSqlFunctionProperties(), translatedHashExpression, Optional.empty()).get());
 
         return new FilterAndProjectOperator.FilterAndProjectOperatorFactory(
                 operatorId,
@@ -288,7 +280,7 @@ public abstract class AbstractOperatorBenchmark
                 localQueryRunner.getScheduler(),
                 new DataSize(256, MEGABYTE),
                 spillSpaceTracker)
-                .addTaskContext(new TaskStateMachine(new TaskId("query", 0, 0), localQueryRunner.getExecutor()),
+                .addTaskContext(new TaskStateMachine(new TaskId("query", 0, 0, 0), localQueryRunner.getExecutor()),
                         session,
                         false,
                         false,

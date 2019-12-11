@@ -13,12 +13,17 @@
  */
 package com.facebook.presto.metadata;
 
+import com.facebook.airlift.discovery.client.ServiceDescriptor;
+import com.facebook.airlift.discovery.client.ServiceSelector;
+import com.facebook.airlift.discovery.client.ServiceType;
+import com.facebook.airlift.http.client.HttpClient;
+import com.facebook.airlift.log.Logger;
+import com.facebook.airlift.node.NodeInfo;
 import com.facebook.presto.client.NodeVersion;
-import com.facebook.presto.connector.ConnectorId;
 import com.facebook.presto.connector.system.GlobalSystemConnector;
 import com.facebook.presto.failureDetector.FailureDetector;
 import com.facebook.presto.server.InternalCommunicationConfig;
-import com.facebook.presto.spi.Node;
+import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.NodeState;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
@@ -27,12 +32,6 @@ import com.google.common.collect.ImmutableSetMultimap;
 import com.google.common.collect.SetMultimap;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Sets.SetView;
-import io.airlift.discovery.client.ServiceDescriptor;
-import io.airlift.discovery.client.ServiceSelector;
-import io.airlift.discovery.client.ServiceType;
-import io.airlift.http.client.HttpClient;
-import io.airlift.log.Logger;
-import io.airlift.node.NodeInfo;
 import org.weakref.jmx.Managed;
 
 import javax.annotation.PostConstruct;
@@ -53,14 +52,14 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
+import static com.facebook.airlift.concurrent.Threads.threadsNamed;
+import static com.facebook.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
 import static com.facebook.presto.spi.NodeState.ACTIVE;
 import static com.facebook.presto.spi.NodeState.INACTIVE;
 import static com.facebook.presto.spi.NodeState.SHUTTING_DOWN;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.collect.Sets.difference;
-import static io.airlift.concurrent.Threads.threadsNamed;
-import static io.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newCachedThreadPool;
@@ -81,16 +80,16 @@ public final class DiscoveryNodeManager
     private final ScheduledExecutorService nodeStateUpdateExecutor;
     private final ExecutorService nodeStateEventExecutor;
     private final boolean httpsRequired;
-    private final PrestoNode currentNode;
+    private final InternalNode currentNode;
 
     @GuardedBy("this")
-    private SetMultimap<ConnectorId, Node> activeNodesByConnectorId;
+    private SetMultimap<ConnectorId, InternalNode> activeNodesByConnectorId;
 
     @GuardedBy("this")
     private AllNodes allNodes;
 
     @GuardedBy("this")
-    private Set<Node> coordinators;
+    private Set<InternalNode> coordinators;
 
     @GuardedBy("this")
     private final List<Consumer<AllNodes>> listeners = new ArrayList<>();
@@ -121,13 +120,13 @@ public final class DiscoveryNodeManager
         refreshNodesInternal();
     }
 
-    private static PrestoNode findCurrentNode(List<ServiceDescriptor> allServices, String currentNodeId, NodeVersion expectedNodeVersion, boolean httpsRequired)
+    private static InternalNode findCurrentNode(List<ServiceDescriptor> allServices, String currentNodeId, NodeVersion expectedNodeVersion, boolean httpsRequired)
     {
         for (ServiceDescriptor service : allServices) {
             URI uri = getHttpUri(service, httpsRequired);
             NodeVersion nodeVersion = getNodeVersion(service);
             if (uri != null && nodeVersion != null) {
-                PrestoNode node = new PrestoNode(service.getNodeId(), uri, nodeVersion, isCoordinator(service));
+                InternalNode node = new InternalNode(service.getNodeId(), uri, nodeVersion, isCoordinator(service));
 
                 if (node.getNodeIdentifier().equals(currentNodeId)) {
                     checkState(
@@ -159,13 +158,13 @@ public final class DiscoveryNodeManager
     private void pollWorkers()
     {
         AllNodes allNodes = getAllNodes();
-        Set<Node> aliveNodes = ImmutableSet.<Node>builder()
+        Set<InternalNode> aliveNodes = ImmutableSet.<InternalNode>builder()
                 .addAll(allNodes.getActiveNodes())
                 .addAll(allNodes.getShuttingDownNodes())
                 .build();
 
         ImmutableSet<String> aliveNodeIds = aliveNodes.stream()
-                .map(Node::getNodeIdentifier)
+                .map(InternalNode::getNodeIdentifier)
                 .collect(toImmutableSet());
 
         // Remove nodes that don't exist anymore
@@ -174,9 +173,9 @@ public final class DiscoveryNodeManager
         nodeStates.keySet().removeAll(deadNodes);
 
         // Add new nodes
-        for (Node node : aliveNodes) {
+        for (InternalNode node : aliveNodes) {
             nodeStates.putIfAbsent(node.getNodeIdentifier(),
-                    new RemoteNodeState(httpClient, uriBuilderFrom(node.getHttpUri()).appendPath("/v1/info/state").build()));
+                    new RemoteNodeState(httpClient, uriBuilderFrom(node.getInternalUri()).appendPath("/v1/info/state").build()));
         }
 
         // Schedule refresh
@@ -206,18 +205,18 @@ public final class DiscoveryNodeManager
                 .filter(service -> !failureDetector.getFailed().contains(service))
                 .collect(toImmutableSet());
 
-        ImmutableSet.Builder<Node> activeNodesBuilder = ImmutableSet.builder();
-        ImmutableSet.Builder<Node> inactiveNodesBuilder = ImmutableSet.builder();
-        ImmutableSet.Builder<Node> shuttingDownNodesBuilder = ImmutableSet.builder();
-        ImmutableSet.Builder<Node> coordinatorsBuilder = ImmutableSet.builder();
-        ImmutableSetMultimap.Builder<ConnectorId, Node> byConnectorIdBuilder = ImmutableSetMultimap.builder();
+        ImmutableSet.Builder<InternalNode> activeNodesBuilder = ImmutableSet.builder();
+        ImmutableSet.Builder<InternalNode> inactiveNodesBuilder = ImmutableSet.builder();
+        ImmutableSet.Builder<InternalNode> shuttingDownNodesBuilder = ImmutableSet.builder();
+        ImmutableSet.Builder<InternalNode> coordinatorsBuilder = ImmutableSet.builder();
+        ImmutableSetMultimap.Builder<ConnectorId, InternalNode> byConnectorIdBuilder = ImmutableSetMultimap.builder();
 
         for (ServiceDescriptor service : services) {
             URI uri = getHttpUri(service, httpsRequired);
             NodeVersion nodeVersion = getNodeVersion(service);
             boolean coordinator = isCoordinator(service);
             if (uri != null && nodeVersion != null) {
-                PrestoNode node = new PrestoNode(service.getNodeId(), uri, nodeVersion, coordinator);
+                InternalNode node = new InternalNode(service.getNodeId(), uri, nodeVersion, coordinator);
                 NodeState nodeState = getNodeState(node);
 
                 switch (nodeState) {
@@ -253,9 +252,9 @@ public final class DiscoveryNodeManager
 
         if (allNodes != null) {
             // log node that are no longer active (but not shutting down)
-            SetView<Node> missingNodes = difference(allNodes.getActiveNodes(), Sets.union(activeNodesBuilder.build(), shuttingDownNodesBuilder.build()));
-            for (Node missingNode : missingNodes) {
-                log.info("Previously active node is missing: %s (last seen at %s)", missingNode.getNodeIdentifier(), missingNode.getHostAndPort());
+            SetView<InternalNode> missingNodes = difference(allNodes.getActiveNodes(), Sets.union(activeNodesBuilder.build(), shuttingDownNodesBuilder.build()));
+            for (InternalNode missingNode : missingNodes) {
+                log.info("Previously active node is missing: %s (last seen at %s)", missingNode.getNodeIdentifier(), missingNode.getHost());
             }
         }
 
@@ -275,7 +274,7 @@ public final class DiscoveryNodeManager
         }
     }
 
-    private NodeState getNodeState(PrestoNode node)
+    private NodeState getNodeState(InternalNode node)
     {
         if (expectedNodeVersion.equals(node.getNodeVersion())) {
             if (isNodeShuttingDown(node.getNodeIdentifier())) {
@@ -323,7 +322,7 @@ public final class DiscoveryNodeManager
     }
 
     @Override
-    public Set<Node> getNodes(NodeState state)
+    public Set<InternalNode> getNodes(NodeState state)
     {
         switch (state) {
             case ACTIVE:
@@ -338,19 +337,19 @@ public final class DiscoveryNodeManager
     }
 
     @Override
-    public synchronized Set<Node> getActiveConnectorNodes(ConnectorId connectorId)
+    public synchronized Set<InternalNode> getActiveConnectorNodes(ConnectorId connectorId)
     {
         return activeNodesByConnectorId.get(connectorId);
     }
 
     @Override
-    public Node getCurrentNode()
+    public InternalNode getCurrentNode()
     {
         return currentNode;
     }
 
     @Override
-    public synchronized Set<Node> getCoordinators()
+    public synchronized Set<InternalNode> getCoordinators()
     {
         return coordinators;
     }
